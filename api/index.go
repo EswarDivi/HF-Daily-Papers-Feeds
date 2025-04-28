@@ -17,6 +17,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/net/html"
@@ -136,6 +141,10 @@ var (
 	redisConnected bool
 	initOnce       sync.Once
 	logger         = slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	r2Client       *s3.Client
+	r2Bucket       string
+	r2BucketURL    string
+	r2Ready        bool
 )
 
 func scrapeAbstract(ctx context.Context, url string) (string, error) {
@@ -364,6 +373,70 @@ func initRedis() {
 	logger.Info("Successfully connected to Redis")
 }
 
+func initR2() {
+	endpoint := os.Getenv("R2_ENDPOINT")
+	accessKey := os.Getenv("R2_ACCESS_KEY_ID")
+	secretKey := os.Getenv("R2_SECRET_ACCESS_KEY")
+	bucket := os.Getenv("R2_BUCKET_NAME")
+	if endpoint == "" || accessKey == "" || secretKey == "" || bucket == "" {
+		logger.Warn("Cloudflare R2 env vars missing, audio podcast will not be stored in R2")
+		return
+	}
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
+		config.WithRegion("auto"),
+		config.WithEndpointResolverWithOptions(aws.EndpointResolverWithOptionsFunc(
+			func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+				return aws.Endpoint{URL: endpoint, SigningRegion: "auto"}, nil
+			},
+		)),
+	)
+	if err != nil {
+		logger.Error("Failed to init R2 S3 client", "error", err)
+		return
+	}
+	r2Client = s3.NewFromConfig(cfg)
+	r2Bucket = bucket
+	r2BucketURL = endpoint
+	r2Ready = true
+	logger.Info("Cloudflare R2 S3 client initialized")
+}
+
+func r2PutPodcast(ctx context.Context, key string, data []byte) error {
+	if !r2Ready {
+		return fmt.Errorf("R2 not initialized")
+	}
+	logger.Info("Uploading podcast to R2", "key", key, "size", len(data))
+	_, err := r2Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      &r2Bucket,
+		Key:         &key,
+		Body:        bytes.NewReader(data),
+		ContentType: aws.String("audio/mpeg"),
+		ACL:         types.ObjectCannedACLPublicRead,
+	})
+	if err != nil {
+		logger.Error("Failed to upload podcast to R2", "key", key, "error", err)
+	} else {
+		logger.Info("Successfully uploaded podcast to R2", "key", key, "size", len(data))
+	}
+	return err
+}
+
+func r2GetPodcast(ctx context.Context, key string) ([]byte, error) {
+	if !r2Ready {
+		return nil, fmt.Errorf("R2 not initialized")
+	}
+	resp, err := r2Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &r2Bucket,
+		Key:    &key,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
 func getCachedFeed(ctx context.Context, requestURL string) ([]byte, error) {
 	if !redisConnected {
 		return generateFeedDirect(ctx, requestURL)
@@ -530,18 +603,19 @@ func updateAllCaches(ctx context.Context) error {
 		return fmt.Errorf("failed to generate podcast audio: %w", err)
 	}
 
-	// Update podcast cache
-	err = rdb.Set(ctx, podcastCacheKey, audioData, cacheDuration).Err()
-	if err != nil {
-		logger.Error("Failed to update podcast cache",
-			"key", podcastCacheKey,
-			"size", len(audioData),
-			"error", err)
-		return fmt.Errorf("failed to update podcast cache: %w", err)
+	// update cache in R2
+	if r2Ready {
+		err = r2PutPodcast(ctx, "podcast-latest.mp3", audioData)
+		if err != nil {
+			logger.Error("Failed to upload podcast to R2", "key", "podcast-latest.mp3", "error", err)
+			return fmt.Errorf("failed to upload podcast to R2: %w", err)
+		}
+	} else {
+		logger.Warn("R2 not ready, podcast will not be stored in R2")
 	}
 
 	logger.Info("Successfully updated podcast cache",
-		"key", podcastCacheKey,
+		"key", "podcast-latest.mp3",
 		"size", len(audioData))
 
 	logger.Info("Successfully updated all caches (feed, summary, conversation, and podcast)")
@@ -589,7 +663,7 @@ func parseRSSToMarkdown(xmlContent string) (string, error) {
 // summarizeWithLLM summarizes the markdown content using Hugging Face Router API
 // It now accepts a context for cancellation and timeout, and uses an HTTP client with a timeout.
 func summarizeWithLLM(ctx context.Context, markdownContent string) (string, error) {
-	apiURL := "https://router.huggingface.co/hf-inference/models/Qwen/Qwen2.5-72B-Instruct/v1/chat/completions"
+	apiURL := "https://router.huggingface.co/together/v1/chat/completions"
 	apiKey := os.Getenv("HF_API_KEY")
 
 	if apiKey == "" {
@@ -618,7 +692,7 @@ Below are the paper abstracts and information in markdown format:
 ` + markdownContent
 
 	request := LLMRequest{
-		Model: "Qwen/Qwen2.5-72B-Instruct",
+		Model: "Qwen/Qwen2.5-72B-Instruct-Turbo",
 		Messages: []Message{
 			{
 				Role:    "user",
@@ -848,7 +922,7 @@ func extractConversation(ctx context.Context, text string, maxRetries int) (*Con
 
 func tryGenerateConversation(ctx context.Context, text string) (*ConversationData, error) {
 
-	apiURL := "https://router.huggingface.co/sambanova/v1/chat/completions"
+	apiURL := "https://router.huggingface.co/together/v1/chat/completions"
 	apiKey := os.Getenv("HF_API_KEY")
 
 	if apiKey == "" {
@@ -881,7 +955,7 @@ func tryGenerateConversation(ctx context.Context, text string) (*ConversationDat
         }`, text)
 
 	request := LLMRequest{
-		Model: "Qwen2.5-72B-Instruct",
+		Model: "Qwen/Qwen2.5-72B-Instruct-Turbo",
 		Messages: []Message{
 			{
 				Role:    "user",
@@ -1079,17 +1153,14 @@ func generateaudiopodcast(ctx context.Context, text string) ([]byte, error) {
 }
 
 func getcachedpodcast(ctx context.Context, text string) ([]byte, error) {
-	if redisConnected {
-		audioData, err := rdb.Get(ctx, podcastCacheKey).Bytes()
+	key := "podcast-latest.mp3"
+	if r2Ready {
+		audioData, err := r2GetPodcast(ctx, key)
 		if err == nil {
-			logger.Info("Podcast cache hit",
-				"key", podcastCacheKey,
-				"size", len(audioData))
+			logger.Info("Podcast found in R2", "key", key, "size", len(audioData))
 			return audioData, nil
-		} else if !errors.Is(err, redis.Nil) {
-			logger.Warn("Redis Get failed for podcast",
-				"key", podcastCacheKey,
-				"error", err)
+		} else {
+			logger.Warn("R2 Get failed for podcast, will generate", "key", key, "error", err)
 		}
 	}
 
@@ -1105,18 +1176,13 @@ func getcachedpodcast(ctx context.Context, text string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to generate audio podcast: %w", err)
 	}
 
-	// Cache the audio data if Redis is connected
-	if redisConnected {
-		err = rdb.Set(ctx, podcastCacheKey, audioData, cacheDuration).Err()
+	// Upload to R2 if ready
+	if r2Ready {
+		err = r2PutPodcast(ctx, key, audioData)
 		if err != nil {
-			logger.Warn("Failed to cache podcast",
-				"key", podcastCacheKey,
-				"size", len(audioData),
-				"error", err)
+			logger.Warn("Failed to upload podcast to R2", "key", key, "error", err)
 		} else {
-			logger.Info("Successfully cached new podcast",
-				"key", podcastCacheKey,
-				"size", len(audioData))
+			logger.Info("Successfully uploaded podcast to R2", "key", key, "size", len(audioData))
 		}
 	}
 
@@ -1128,6 +1194,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	// Initialize Redis on first request (using background context for initialization)
 	initOnce.Do(func() {
 		initRedis()
+		initR2()
 	})
 
 	// Get the request context
@@ -1189,10 +1256,10 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 		case "/api/conversation":
 			// Pass request context to summary retrieval/generation
-			summary, err := getCachedSummary(reqCtx, requestURL)
+			summary, err := getCachedFeed(reqCtx, requestURL)
 			if err != nil {
-				logger.Error("Failed to get cached summary", "error", err)
-				http.Error(w, fmt.Sprintf("Error generating summary: %v", err), http.StatusInternalServerError)
+				logger.Error("Failed to get cached feed", "error", err)
+				http.Error(w, fmt.Sprintf("Error getting Feed: %v", err), http.StatusInternalServerError)
 				return
 			}
 			// Generate podcast conversation
@@ -1207,17 +1274,17 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			// Write the conversation response
 			w.Write([]byte(conversation))
 			return
-			
+
 		case "/api/podcast":
-			summary, err := getCachedSummary(reqCtx, requestURL)
+			feed, err := getCachedFeed(reqCtx, requestURL)
 			if err != nil {
-				logger.Error("Failed to get cached summary", "error", err)
-				http.Error(w, fmt.Sprintf("Error generating summary: %v", err), http.StatusInternalServerError)
+				logger.Error("Failed to get cached feed", "error", err)
+				http.Error(w, fmt.Sprintf("Error getting Feed: %v", err), http.StatusInternalServerError)
 				return
 			}
 
 			// Get or generate podcast audio
-			audioData, err := getcachedpodcast(reqCtx, string(summary))
+			audioData, err := getcachedpodcast(reqCtx, string(feed))
 			if err != nil {
 				logger.Error("Failed to get/generate podcast", "error", err)
 				http.Error(w, fmt.Sprintf("Error with podcast: %v", err), http.StatusInternalServerError)
